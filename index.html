@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>比個手勢試試看</title>
+<style>
+  :root { --bg:#0f1115; --fg:#f3f4f6; --muted:#9ca3af; --accent:#22c55e; --card:#1a1d24; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family: -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+         display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:16px; }
+  h1 { font-size:1.4rem; margin:8px 0 4px; }
+  p.hint { color:var(--muted); margin:0 0 12px; text-align:center; }
+  .stage { position:relative; width:min(720px, 100%); aspect-ratio:4/3;
+           background:#000; border-radius:16px; overflow:hidden; }
+  video, canvas.overlay { position:absolute; inset:0; width:100%; height:100%;
+           object-fit:cover; transform:scaleX(-1); /* 鏡像，像照鏡子 */ }
+  #fx { position:absolute; inset:0; pointer-events:none; overflow:hidden; }
+  .sticker { position:absolute; bottom:-80px; font-size:64px; will-change:transform,opacity;
+             animation: floatUp 2.2s ease-out forwards; }
+  .big { position:absolute; left:50%; top:50%; font-size:160px;
+         transform:translate(-50%,-50%) scale(0); animation: pop 1.2s ease-out forwards; }
+  @keyframes floatUp {
+    0%   { transform: translateY(0) rotate(0deg); opacity:1; }
+    100% { transform: translateY(-115vh) rotate(var(--rot)); opacity:0; }
+  }
+  @keyframes pop {
+    0% { transform:translate(-50%,-50%) scale(0); opacity:1; }
+    30% { transform:translate(-50%,-50%) scale(1.2); }
+    50% { transform:translate(-50%,-50%) scale(1); opacity:1; }
+    100% { transform:translate(-50%,-50%) scale(1); opacity:0; }
+  }
+  .status { margin-top:12px; padding:10px 16px; background:var(--card);
+            border-radius:999px; font-size:1rem; min-width:260px; text-align:center; }
+  .status b { color:var(--accent); }
+  .start { position:absolute; inset:0; display:flex; flex-direction:column; gap:12px;
+           align-items:center; justify-content:center; background:rgba(0,0,0,.6); z-index:2; }
+  button { font-size:1.1rem; padding:12px 28px; border:0; border-radius:999px;
+           background:var(--accent); color:#04130a; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .legend { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-top:12px;
+            max-width:720px; }
+  .legend span { background:var(--card); padding:6px 12px; border-radius:999px; font-size:.9rem; }
+  label { color:var(--muted); font-size:.9rem; margin-top:10px; }</style>
+</head>
+<body>
+  <h1>🖐 比個手勢試試看</h1>
+  <p class="hint">對著鏡頭比出下面的手勢，停住約半秒，就會跳出特效</p>
+
+  <div class="stage">
+    <video id="cam" playsinline muted></video>
+    <canvas id="overlay" class="overlay"></canvas>
+    <div id="fx"></div>
+    <div class="start" id="startBox">
+      <button id="startBtn" disabled>載入 AI 模型中…</button>
+      <small style="color:#ccc">畫面只在你的電腦上分析，不會上傳</small>
+    </div>
+  </div>
+
+  <div class="status" id="status">等待開始</div>
+  <div class="legend" id="legend"></div>
+  <label><input type="checkbox" id="showDots" checked> 顯示手部 21 個關鍵點</label>
+<script type="module">
+import { GestureRecognizer, FilesetResolver, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ============================================================
+// ✏️ 想換貼圖？改這裡就好！
+//   key：模型認得的手勢名稱（不要改）
+//   name：顯示的中文名稱
+//   stickers：會飄上來的貼圖（可以放多個 emoji，隨機出現）
+// ============================================================
+const GESTURES = {
+  Thumb_Up:    { name: "比讚",     stickers: ["👍", "💯", "✨", "🎉"] },
+  Thumb_Down:  { name: "倒讚",     stickers: ["👎", "🌧️", "😢"] },
+  Victory:     { name: "比耶",     stickers: ["✌️", "📸", "😆", "🌈"] },
+  Open_Palm:   { name: "張開手掌", stickers: ["👋", "🙌", "🎈"] },
+  Closed_Fist: { name: "握拳",     stickers: ["✊", "💪", "🔥"] },
+  Pointing_Up: { name: "食指朝上", stickers: ["☝️", "💡", "⭐"] },
+  ILoveYou:    { name: "我愛你",   stickers: ["🤟", "❤️", "💖", "🥰"] },
+};
+
+const HOLD_FRAMES = 5;      // 同一手勢累積出現幾個畫面才算數（防誤觸）
+const MISS_TOLERANCE = 4;   // 中間偶爾漏掉幾個畫面也不歸零（手抖、模糊時更穩）
+const COOLDOWN_MS = 1500;   // 觸發後要等多久才能再觸發
+const MIN_SCORE = 0.45;     // 模型信心分數門檻（0~1），越低越容易觸發
+
+// ---- 下面是程式本體 ----
+const video = document.getElementById("cam");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const fx = document.getElementById("fx");
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("startBtn");
+const showDots = document.getElementById("showDots");
+
+document.getElementById("legend").innerHTML = Object.values(GESTURES)
+  .map(g => `<span>${g.stickers[0]} ${g.name}</span>`).join("");
+
+let recognizer, lastGesture = null, holdCount = 0, lastFire = 0, lastVideoTime = -1;
+
+// 1) 載入 MediaPipe 手勢辨識模型
+try {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  recognizer = await GestureRecognizer.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numHands: 2,
+    cannedGesturesClassifierOptions: { maxResults: -1 }, // 回傳每種手勢的分數，第二名的手勢也有機會被採用
+  });
+  startBtn.textContent = "▶ 開啟鏡頭";
+  startBtn.disabled = false;
+  window.__modelReady = true;
+} catch (e) {
+  startBtn.textContent = "模型載入失敗，請重新整理";
+  console.error(e);
+}
+
+// 2) 開鏡頭
+startBtn.onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    video.srcObject = stream;
+    await video.play();
+    document.getElementById("startBox").remove();
+    statusEl.textContent = "把手放進畫面裡吧！";
+    requestAnimationFrame(loop);
+  } catch (e) {
+    statusEl.textContent = "無法開啟鏡頭：請允許瀏覽器使用相機";
+    console.error(e);
+  }
+};
+
+// 3) 每個畫面：辨識 → 判斷 → 觸發
+function loop() {
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = recognizer.recognizeForVideo(video, performance.now());
+    draw(result);
+    handle(result);
+  }
+  requestAnimationFrame(loop);
+}
+
+function draw(result) {
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!showDots.checked) return;
+  const du = new DrawingUtils(ctx);
+  for (const lm of result.landmarks) {
+    du.drawConnectors(lm, GestureRecognizer.HAND_CONNECTIONS, { color: "#22c55e", lineWidth: 3 });
+    du.drawLandmarks(lm, { color: "#fff", radius: 3 });
+  }
+}
+
+let missCount = 0;
+function handle(result) {
+  // 兩隻手都看：挑分數最高、而且不是「None（沒手勢）」的那個
+  let top = null;
+  for (const hand of result.gestures) {
+    for (const c of hand) {
+      if (GESTURES[c.categoryName] && c.score >= MIN_SCORE && (!top || c.score > top.score)) top = c;
+    }
+  }
+  const name = top?.categoryName;
+  const g = GESTURES[name];
+
+  if (!g) {
+    // 偶爾漏一兩個畫面不歸零
+    if (++missCount > MISS_TOLERANCE) { lastGesture = null; holdCount = 0; }
+    if (!lastGesture) statusEl.textContent =
+      result.landmarks.length ? "看到手了 👀 比個手勢吧" : "把手放進畫面裡吧！";
+    return;
+  }
+  missCount = 0;
+
+  holdCount = name === lastGesture ? holdCount + 1 : 1;
+  lastGesture = name;
+  statusEl.innerHTML = `偵測到：<b>${g.name}</b>（信心 ${(top.score * 100).toFixed(0)}%）`;
+
+  const now = performance.now();
+  if (holdCount >= HOLD_FRAMES && now - lastFire > COOLDOWN_MS) {
+    lastFire = now;
+    holdCount = 0;
+    burst(g.stickers);
+  }
+}
+
+// 4) 特效：一個大貼圖彈出 + 一堆小貼圖往上飄
+function burst(stickers) {
+  const big = document.createElement("div");
+  big.className = "big";
+  big.textContent = stickers[0];
+  fx.appendChild(big);
+  setTimeout(() => big.remove(), 1300);
+
+  for (let i = 0; i < 14; i++) {
+    const s = document.createElement("div");
+    s.className = "sticker";
+    s.textContent = stickers[Math.floor(Math.random() * stickers.length)];
+    s.style.left = Math.random() * 90 + "%";
+    s.style.fontSize = 36 + Math.random() * 40 + "px";
+    s.style.animationDelay = Math.random() * 0.5 + "s";
+    s.style.setProperty("--rot", (Math.random() * 120 - 60) + "deg");
+    fx.appendChild(s);
+    setTimeout(() => s.remove(), 3000);
+  }
+}
+</script>
+</body>
+</html>
